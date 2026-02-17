@@ -22,7 +22,7 @@ use aes::{
 use md5::{Digest, Md5};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     device::{Device, InitSubscriber},
@@ -146,15 +146,15 @@ impl Gateway {
                                     .lock()
                                     .unwrap()
                                     .remove(&params.id)
-                                    .expect("unexpected response sender missing")
+                                    .expect("unexpected missing response sender")
                                     .send(Err(e))
                             {
-                                warn!(?error, "channel closed, ignore the message");
+                                debug!(?error, "receiver dropped before send error delivered");
                             }
                         }
                         Err(TryRecvError::Empty) => (),
                         Err(TryRecvError::Disconnected) => {
-                            info!("channel closure detected, shutting down the worker");
+                            info!("channel closed, shutting down the worker");
                             return;
                         }
                     }
@@ -172,21 +172,29 @@ impl Gateway {
                         }
                     };
                     if buf.len() < 32 || buf[..2] != PREFIX {
-                        warn!("invalid message received, ignore it");
+                        debug!("invalid packet header");
                         continue;
                     }
 
                     let device_id = buf.to_u64::<4>().to_string();
 
                     if buf.len() == 32 {
-                        if let Err(error) = response_senders
+                        match response_senders
                             .lock()
                             .unwrap()
                             .remove(&RequestId::Ping(device_id))
-                            .expect("unexpected response sender missing")
-                            .send(Ok(RawResponse::Ping(Box::from(buf))))
                         {
-                            warn!(?error, "channel closed, ignore the message");
+                            Some(sender) => {
+                                if let Err(error) =
+                                    sender.send(Ok(RawResponse::Ping(Box::from(buf))))
+                                {
+                                    debug!(
+                                        ?error,
+                                        "receiver dropped before ping response delivered"
+                                    );
+                                }
+                            }
+                            None => debug!("no pending ping request, ignoring"),
                         }
                         continue;
                     }
@@ -198,14 +206,14 @@ impl Gateway {
                         Md5::digest(&buf)
                     };
                     if calculated_hash.as_slice() != original_hash {
-                        warn!("invalid message received, ignore it");
+                        warn!(device_id, "integrity check failed");
                         continue;
                     }
 
                     let message = {
                         let cipher_caches = cipher_caches.read().unwrap();
                         let Some(CipherCache { key, iv }) = cipher_caches.get(&device_id) else {
-                            warn!("device uninitialized, ignore the message");
+                            warn!(device_id, "device uninitialized");
                             continue;
                         };
                         let message = match cbc::Decryptor::<Aes128>::new_from_slices(key, iv)
@@ -214,14 +222,14 @@ impl Gateway {
                         {
                             Ok(message) => message,
                             Err(error) => {
-                                warn!(?error, "failed to decrypt the message, ignore it");
+                                warn!(device_id, ?error, "decryption failed");
                                 continue;
                             }
                         };
                         match serde_json::from_slice::<Value>(&message) {
                             Ok(message) => message,
                             Err(error) => {
-                                warn!(?error, "failed to parse the message, ignore it");
+                                warn!(device_id, ?error, "invalid JSON payload");
                                 continue;
                             }
                         }
@@ -232,17 +240,25 @@ impl Gateway {
                         .and_then(|id| id.as_u64())
                         .map(|id| id as u32)
                     else {
-                        warn!("failed to parse the message id, ignore the message");
+                        warn!(device_id, "failed to parse the message id");
                         continue;
                     };
-                    if let Err(error) = response_senders
+                    match response_senders
                         .lock()
                         .unwrap()
                         .remove(&RequestId::Message(id))
-                        .expect("unexpected response sender missing")
-                        .send(Ok(RawResponse::Message(message)))
                     {
-                        warn!(?error, "channel closed, ignore the message");
+                        Some(sender) => {
+                            if let Err(error) = sender.send(Ok(RawResponse::Message(message))) {
+                                debug!(
+                                    device_id,
+                                    id,
+                                    ?error,
+                                    "receiver dropped before response delivered"
+                                );
+                            }
+                        }
+                        None => debug!(device_id, id, "no pending request, ignoring"),
                     }
                 }
             }))
@@ -386,7 +402,6 @@ pub enum Error {
     Serialize(serde_json::Error),
     Deserialize(serde_json::Error),
     Send(io::Error),
-    InvalidMessage,
     ReceiverAlreadyStarted,
     DeviceUninitialized,
     ShuttingDown,
@@ -400,10 +415,9 @@ impl error::Error for Error {
             Error::Serialize(e) => Some(e),
             Error::Deserialize(e) => Some(e),
             Error::Send(e) => Some(e),
-            Error::InvalidMessage
-            | Error::ReceiverAlreadyStarted
-            | Error::DeviceUninitialized
-            | Error::ShuttingDown => None,
+            Error::ReceiverAlreadyStarted | Error::DeviceUninitialized | Error::ShuttingDown => {
+                None
+            }
         }
     }
 }
@@ -411,15 +425,14 @@ impl error::Error for Error {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Init(e) => write!(f, "failed to initialize: {e}"),
-            Error::Parse(e) => write!(f, "failed to parse id: {e}"),
-            Error::Serialize(e) => write!(f, "failed to serialize payload: {e}"),
-            Error::Deserialize(e) => write!(f, "failed to deserialize payload: {e}"),
-            Error::Send(e) => write!(f, "failed to send message: {e}"),
-            Error::InvalidMessage => write!(f, "invalid message"),
+            Error::Init(_) => write!(f, "failed to initialize"),
+            Error::Parse(_) => write!(f, "failed to parse id"),
+            Error::Serialize(_) => write!(f, "failed to serialize"),
+            Error::Deserialize(_) => write!(f, "failed to deserialize"),
+            Error::Send(_) => write!(f, "failed to send"),
             Error::ReceiverAlreadyStarted => write!(f, "receiver already started"),
             Error::DeviceUninitialized => write!(f, "device uninitialized"),
-            Error::ShuttingDown => write!(f, "the gateway is shutting down"),
+            Error::ShuttingDown => write!(f, "gateway is shutting down"),
         }
     }
 }
