@@ -388,8 +388,8 @@ impl InitSubscriber for Gateway {
         cipher_caches.insert(
             device.id.clone(),
             CipherCache {
-                key: key.into(),
-                iv: iv.into(),
+                key: <[u8; 16]>::from(key),
+                iv: <[u8; 16]>::from(iv),
             },
         );
     }

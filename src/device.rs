@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Device {
     pub id: String,
     pub name: String,
